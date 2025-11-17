@@ -2,155 +2,284 @@
 import os
 import re
 import json
+import time
 import base64
 import requests
+from urllib.parse import urljoin, urlparse
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# keep same secret you used in the form
+# Keep same secret used in the form (or set QUIZ_SECRET env var on Render)
 SECRET = os.environ.get("QUIZ_SECRET", "TDS24f1000999-LLM-Quiz-2025!")
 
-# Regex to find long base64 blocks (the demo embeds one)
-BASE64_RE = re.compile(r"[A-Za-z0-9+/=]{80,}")
+# Regexes / helpers
+BASE64_RE = re.compile(r"([A-Za-z0-9+/=]{80,})")
+CSV_LINK_RE = re.compile(r'href=["\']([^"\']+\.(csv|txt|json|zip))["\']', re.IGNORECASE)
+PDF_LINK_RE = re.compile(r'href=["\']([^"\']+\.pdf)["\']', re.IGNORECASE)
+SUBMIT_RE = re.compile(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", re.IGNORECASE)
+JSON_BLOCK_RE = re.compile(r"(\{[\s\S]{1,4000}\})", re.DOTALL)
+
+# timeouts & limits
+REQ_TIMEOUT = 20
+MAX_LOOP = 8
+
+# --- small solvers for common task types ---
+def try_decode_first_base64(text):
+    for m in BASE64_RE.finditer(text):
+        cand = m.group(1)
+        try:
+            dec = base64.b64decode(cand).decode("utf-8", errors="ignore")
+        except Exception:
+            continue
+        # return dec if it contains "answer" or "submit" or looks like JSON
+        if "answer" in dec or "submit" in dec or dec.strip().startswith("{"):
+            return dec
+    return None
+
+def try_extract_json_from_text(text):
+    m = JSON_BLOCK_RE.search(text)
+    if not m:
+        return None
+    js = m.group(1)
+    try:
+        return json.loads(js)
+    except Exception:
+        return None
+
+def sum_value_column_from_csv_text(csv_text, colname="value"):
+    import csv, io
+    rdr = csv.DictReader(io.StringIO(csv_text))
+    total = 0.0
+    found = False
+    for r in rdr:
+        if colname in r:
+            found = True
+            try:
+                total += float(r[colname])
+            except Exception:
+                # try to strip commas
+                try:
+                    total += float(r[colname].replace(",", ""))
+                except Exception:
+                    pass
+    if found:
+        # if integer-like, return int
+        if abs(total - round(total)) < 1e-9:
+            return int(round(total))
+        return total
+    return None
+
+def fetch_text(url):
+    headers = {"User-Agent": "LLM-Quiz-Agent/1.0"}
+    r = requests.get(url, headers=headers, timeout=REQ_TIMEOUT)
+    r.raise_for_status()
+    return r.text
+
+def absolute_link(base, link):
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    return urljoin(base, link)
+
+def find_first_submit_url(text):
+    m = SUBMIT_RE.search(text)
+    if m:
+        return m.group(0)
+    return None
+
+def find_any_link_to_file(text, base_url):
+    m = CSV_LINK_RE.search(text)
+    if m:
+        return absolute_link(base_url, m.group(1))
+    m = PDF_LINK_RE.search(text)
+    if m:
+        return absolute_link(base_url, m.group(1))
+    # also try plain links
+    m = re.search(r'href=["\']([^"\']+)["\']', text, re.IGNORECASE)
+    if m:
+        return absolute_link(base_url, m.group(1))
+    return None
+
+# a simple main heuristic solver for one page
+def solve_from_page_text(page_text, page_url):
+    """
+    Return an 'answer' (primitive or str), and optionally debug info.
+    """
+    # 1) Try decode base64 embedded JSON payload (demo uses this)
+    decoded = try_decode_first_base64(page_text)
+    if decoded:
+        # try parse JSON inside decoded
+        parsed = try_extract_json_from_text(decoded)
+        if parsed and "answer" in parsed:
+            return parsed["answer"], {"method": "decoded_base64_json", "parsed": parsed}
+        # sometimes decoded is itself plain text answer
+        if decoded.strip() and len(decoded.strip()) < 500:
+            return decoded.strip(), {"method": "decoded_base64_text", "decoded_preview": decoded[:200]}
+
+    # 2) Try find JSON-like block on page
+    parsed2 = try_extract_json_from_text(page_text)
+    if parsed2 and "answer" in parsed2:
+        return parsed2["answer"], {"method": "page_embedded_json", "parsed": parsed2}
+
+    # 3) Look for explicit instructions: "sum of the "value" column in the table on page 2" etc.
+    # If CSV link present, fetch and try to sum 'value' column
+    file_link = find_any_link_to_file(page_text, page_url)
+    if file_link and file_link.lower().endswith(".csv"):
+        try:
+            txt = fetch_text(file_link)
+            s = sum_value_column_from_csv_text(txt, "value")
+            if s is not None:
+                return s, {"method": "csv_sum", "file": file_link}
+        except Exception as e:
+            pass
+
+    # 4) If the page contains "Reverse" or "reverse" and a quoted string, attempt reverse
+    m = re.search(r"reverse[^\\n]*['\"]([^'\"]+)['\"]", page_text, re.IGNORECASE)
+    if m:
+        s = m.group(1)[::-1]
+        return s, {"method": "reverse_string", "input": m.group(1)}
+
+    # 5) Common pattern: "What is the sum of the \"value\" column" (maybe with link to PDF)
+    m = re.search(r"sum of the [\"']?value[\"']? column", page_text, re.IGNORECASE)
+    if m:
+        if file_link and file_link.lower().endswith(".csv"):
+            try:
+                txt = fetch_text(file_link)
+                s = sum_value_column_from_csv_text(txt, "value")
+                if s is not None:
+                    return s, {"method": "csv_sum_detected", "file": file_link}
+            except Exception:
+                pass
+
+    # 6) If nothing matched, try a fallback: look for any small number in the page likely to be answer
+    mnum = re.search(r"answer[:\s]*([0-9]+(?:\.[0-9]+)?)", page_text, re.IGNORECASE)
+    if mnum:
+        val = mnum.group(1)
+        try:
+            if "." in val:
+                return float(val), {"method": "found_number_in_text", "value": val}
+            else:
+                return int(val), {"method": "found_number_in_text", "value": val}
+        except Exception:
+            pass
+
+    # 7) If absolutely nothing, return a minimal "I don't know" (the initial POST can be anything per forum)
+    return "", {"method": "fallback_empty_answer"}
+
+# --- main engine: loop over quiz endpoints ---
+def post_to_submit(submit_url, payload):
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(submit_url, json=payload, headers=headers, timeout=REQ_TIMEOUT)
+    try:
+        return r.status_code, r.json()
+    except Exception:
+        return r.status_code, {"text": r.text}
 
 @app.route("/", methods=["GET"])
 def home():
     return "LLM Quiz API running."
 
 @app.route("/quiz", methods=["POST"])
-def quiz():
+def quiz_entrypoint():
     # 1) Validate JSON
     if not request.is_json:
         return jsonify({"error": "invalid json"}), 400
-    payload = request.get_json()
+    data = request.get_json()
 
     # 2) Required fields
-    email = payload.get("email")
-    secret = payload.get("secret")
-    url = payload.get("url")
-    if email is None or secret is None or url is None:
+    email = data.get("email")
+    secret = data.get("secret")
+    start_url = data.get("url")
+    if not email or not secret or not start_url:
         return jsonify({"error": "missing fields: email, secret, url required"}), 400
 
-    # 3) Check secret
+    # 3) Secret check
     if secret != SECRET:
         return jsonify({"error": "forbidden"}), 403
 
-    # 4) Fetch the quiz page
-    try:
-        r = requests.get(url, timeout=20)
-        page_text = r.text
-    except Exception as e:
-        return jsonify({"error": "failed_fetch", "details": str(e)}), 500
+    timeline = []
+    current_url = start_url
+    # If the provided URL looks like demo, first submit should be to /submit
+    if current_url.endswith("/demo") or current_url.endswith("/demo/"):
+        submit_url = current_url.replace("/demo", "/submit")
+    else:
+        # try to guess submit url by replacing path end with /submit
+        parsed = urlparse(current_url)
+        submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
 
-    # 5) Try to find base64-encoded embedded payloads (common in demo)
-    def try_decode_first_base64(text):
-        for m in BASE64_RE.finditer(text):
-            candidate = m.group(0)
-            # Some candidates may include garbage; try to decode
-            try:
-                decoded = base64.b64decode(candidate).decode("utf-8", errors="ignore")
-                # If decoded looks like JSON, return it
-                stripped = decoded.strip()
-                if (stripped.startswith("{") and stripped.endswith("}")) or ("\"answer\"" in stripped):
-                    return stripped
-                # also return if decoded contains 'submit' or 'answer' strings
-                if "submit" in stripped or "answer" in stripped or "url" in stripped:
-                    return stripped
-            except Exception:
-                continue
-        return None
-
-    decoded_payload_text = try_decode_first_base64(page_text)
-
-    # 6) If we decoded something that looks like JSON, parse it
-    parsed = None
-    if decoded_payload_text:
+    # loop
+    for i in range(MAX_LOOP):
+        loop_item = {"iteration": i+1, "current_url": current_url, "submit_url": submit_url}
         try:
-            parsed = json.loads(decoded_payload_text)
-        except Exception:
-            # Sometimes the decoded text contains extra HTML; try to extract JSON inside
-            jmatch = re.search(r"(\{[\s\S]*\})", decoded_payload_text)
-            if jmatch:
-                try:
-                    parsed = json.loads(jmatch.group(1))
-                except Exception:
-                    parsed = None
-
-    # 7) If parsed and contains 'answer', submit it
-    submit_result = None
-    if parsed and "answer" in parsed:
-        # Find submit URL (prefers provided submit_url in parsed JSON, else find on page)
-        submit_url = parsed.get("submit") or parsed.get("submit_url") or parsed.get("submitUrl")
-        if not submit_url:
-            m = re.search(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", page_text, re.IGNORECASE)
-            if m:
-                submit_url = m.group(0)
-        if not submit_url:
-            # Might be 'https://example.com/submit' pattern
-            m = re.search(r"https?://[^\s'\"<>]+/submit", page_text, re.IGNORECASE)
-            if m:
-                submit_url = m.group(0)
-
-        # build payload
-        sub = {
-            "email": email,
-            "secret": secret,
-            "url": url,
-            "answer": parsed.get("answer")
-        }
-        if submit_url:
+            # fetch the page (GET) to inspect content and attempt to solve
+            page_text = ""
             try:
-                resp = requests.post(submit_url, json=sub, timeout=20)
-                try:
-                    submit_result = {"http_status": resp.status_code, "response_json": resp.json()}
-                except Exception:
-                    submit_result = {"http_status": resp.status_code, "response_text": resp.text}
+                page_text = fetch_text(current_url)
+                loop_item["fetched_page"] = True
             except Exception as e:
-                submit_result = {"error": "submit_failed", "details": str(e)}
-        else:
-            submit_result = {"error": "no_submit_url_found", "parsed": parsed}
+                loop_item["fetched_page"] = False
+                loop_item["fetch_error"] = str(e)
 
-    # 8) If no parsed 'answer', try to locate an 'answer' in the page itself (simple heuristics)
-    if submit_result is None:
-        # try to extract text instructions near "Post your answer" or "answer"
-        answer_heuristic = None
-        # look for JSON-like payload embedded in page text (the demo uses a JSON block inside base64)
-        jmatch = re.search(r"\{\s*\"email\"\s*:\s*\"[^\"]+\"[\s\S]{0,400}\}", page_text)
-        if jmatch:
-            try:
-                j = json.loads(jmatch.group(0))
-                if "answer" in j:
-                    answer_heuristic = j["answer"]
-            except Exception:
-                pass
+            # attempt to derive an answer from the page
+            answer, debug = solve_from_page_text(page_text, current_url)
+            loop_item["solver_debug"] = debug
+            loop_item["answer"] = answer
 
-        if answer_heuristic is not None:
-            # try to submit similarly
-            m = re.search(r"https?://[^\s'\"<>]+/submit[^\s'\"<>]*", page_text, re.IGNORECASE)
-            submit_url = m.group(0) if m else None
-            if submit_url:
-                sub = {"email": email, "secret": secret, "url": url, "answer": answer_heuristic}
-                try:
-                    resp = requests.post(submit_url, json=sub, timeout=20)
-                    try:
-                        submit_result = {"http_status": resp.status_code, "response_json": resp.json()}
-                    except Exception:
-                        submit_result = {"http_status": resp.status_code, "response_text": resp.text}
-                except Exception as e:
-                    submit_result = {"error": "submit_failed", "details": str(e)}
-            else:
-                submit_result = {"error": "no_submit_url_found_but_answer_heuristic", "answer": answer_heuristic}
+            # build submission payload required by quiz
+            submit_payload = {
+                "email": email,
+                "secret": secret,
+                "url": current_url,
+                "answer": answer
+            }
 
-    # 9) Final return: if we submitted, return submission result; otherwise return debug info
-    if submit_result is not None:
-        return jsonify({"status": "submitted_or_attempted", "submit_result": submit_result, "decoded_payload_present": bool(parsed)})
+            # POST to submit_url
+            status, resp = post_to_submit(submit_url, submit_payload)
+            loop_item["submit_http_status"] = status
+            loop_item["submit_response"] = resp
+            timeline.append(loop_item)
 
-    # Nothing found — return the page snippet (small) for debugging
-    snippet = page_text[:2000]
-    return jsonify({"status": "no_answer_found", "snippet": snippet}), 200
+            # If resp contains a new URL to continue, use it; break if none
+            next_url = None
+            if isinstance(resp, dict):
+                # many responses include "url" or "next" or "submit_url"
+                next_url = resp.get("url") or resp.get("next") or resp.get("submit_url") or resp.get("endpoint")
+            # fallback: see if resp text contains a URL
+            if not next_url and isinstance(resp, dict):
+                # check top-level text fields
+                for v in resp.values():
+                    if isinstance(v, str) and v.startswith("http"):
+                        next_url = v
+                        break
 
+            if not next_url:
+                # also try to parse from page_text if server returned a page (rare)
+                m = re.search(r"https?://[^\s'\"<>]+/task[^\s'\"<>]*", json.dumps(resp) if not isinstance(resp, str) else resp, re.IGNORECASE)
+                if m:
+                    next_url = m.group(0)
+
+            if not next_url:
+                # no more tasks — finish
+                return jsonify({"status": "done", "timeline": timeline}), 200
+
+            # otherwise prepare for next iteration
+            current_url = next_url
+            # Derive submit_url for the next resource: prefer same domain /submit path
+            parsed = urlparse(current_url)
+            submit_url = f"{parsed.scheme}://{parsed.netloc}/submit"
+
+            # tiny delay to behave politely
+            time.sleep(0.3)
+            continue
+
+        except Exception as e:
+            loop_item["error"] = str(e)
+            timeline.append(loop_item)
+            return jsonify({"status": "error", "timeline": timeline}), 500
+
+    # If loop limit reached
+    return jsonify({"status": "max_iterations_reached", "timeline": timeline}), 200
 
 if __name__ == "__main__":
-    # For local run only; Render uses gunicorn
+    # Local run (Render uses gunicorn)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
