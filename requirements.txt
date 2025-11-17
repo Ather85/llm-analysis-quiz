@@ -1,4 +1,5 @@
-flask
-gunicorn
+Flask
 requests
-certifi
+beautifulsoup4
+pandas
+SpeechRecognition
